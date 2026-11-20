@@ -30,6 +30,15 @@ python scripts/kk_doctor.py [--tool key_decontam|duck_curve|blank_beats]
 
 `duck-curve` needs numpy only (it reads WAV files with its own small reader: PCM 8/16/24/32-bit and float 32/64-bit). The `--help` of every tool works with nothing installed.
 
+## Install
+
+```
+/plugin marketplace add msamkari/samkari-plugins
+/plugin install keyframe-kit@samkari-plugins
+```
+
+Or load it locally: `claude --plugin-dir /path/to/keyframe-kit`. Install the dependencies below first.
+
 ## Use
 
 Ask Claude: "key out the green background of this sheet", "make a ducking curve for this voiceover at 30 fps", "where is this video blank?". Or run the scripts yourself:
