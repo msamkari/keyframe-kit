@@ -28,6 +28,7 @@ MIN_RATE, MAX_RATE = 4000, 384000
 MAX_SECONDS = 6 * 3600          # longest audio plus tail that is accepted
 MAX_EXISTING_BYTES = 256 * 1024 * 1024
 MAX_SAMPLES = 200 * 1000 * 1000   # total samples (frames x channels) accepted; checked before any conversion
+MAX_ABS_SAMPLE = 1e3              # float WAV samples beyond this are garbage (normal range is -1..1)
 CHUNK_FRAMES = 2 * 1000 * 1000     # frames converted to float64 per step, so temporaries stay small
 
 
@@ -110,9 +111,12 @@ def read_wav(np, path):
     for start in range(0, nframes, CHUNK_FRAMES):
         stop = min(nframes, start + CHUNK_FRAMES)
         part = _decode(np, data[start * frame_bytes:stop * frame_bytes], tag, bits)
-        part = part.reshape(-1, ch).mean(axis=1) if ch > 1 else part
         if not np.all(np.isfinite(part)):
             raise C.ToolError("WAV contains NaN or infinite samples")
+        if part.size and float(np.max(np.abs(part))) > MAX_ABS_SAMPLE:
+            raise C.ToolError("WAV contains samples far outside the normal -1..1 range (above %g): "
+                              "the file is not valid audio" % MAX_ABS_SAMPLE)
+        part = part.reshape(-1, ch).mean(axis=1) if ch > 1 else part
         x[start:stop] = part
     return int(sr), x
 

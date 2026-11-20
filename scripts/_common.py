@@ -94,27 +94,60 @@ def need_module(name):
 
 
 def _in_cwd(path):
+    """True if the file is in the current folder or anywhere below it (real paths, links followed)."""
     here = os.path.normcase(os.path.realpath(os.getcwd()))
-    return os.path.normcase(os.path.realpath(os.path.dirname(os.path.abspath(path)))) == here
+    for cand in (os.path.abspath(path), os.path.realpath(path)):
+        target = os.path.normcase(os.path.realpath(os.path.dirname(cand)))
+        try:
+            if os.path.commonpath([target, here]) == here:
+                return True
+        except ValueError:   # different drives
+            pass
+    return False
+
+
+def which_ffmpeg():
+    """First ffmpeg found on the absolute entries of PATH, or None. Relative and empty PATH entries are ignored
+    (a relative entry such as 'bin' would resolve inside whatever untrusted folder the tool is run from)."""
+    entries = [e for e in os.environ.get("PATH", "").split(os.pathsep) if e and os.path.isabs(e)]
+    if not entries:
+        return None
+    return shutil.which("ffmpeg", path=os.pathsep.join(entries))
+
+
+def is_batch_wrapper(path):
+    """True on Windows for a .bat / .cmd file: cmd.exe would re-parse the command line (& | ^ in a file name)."""
+    return os.name == "nt" and os.path.splitext(path)[1].lower() in (".bat", ".cmd")
+
+
+def ffmpeg_problem(path):
+    """Why a resolved ffmpeg must not be used, or None."""
+    if _in_cwd(path):
+        return ("the ffmpeg found (%s) is in the current folder or below it, which is not trusted. "
+                "Run from another folder, or install a real ffmpeg on PATH. %s." % (path, INSTALL_HINT["ffmpeg"]))
+    if is_batch_wrapper(path):
+        return ("the ffmpeg found on PATH (%s) is a .bat/.cmd wrapper, which is refused on Windows "
+                "(cmd.exe would interpret characters such as & in file names). Put the real ffmpeg.exe "
+                "first on PATH. %s." % (path, INSTALL_HINT["ffmpeg"]))
+    return None
 
 
 def safe_which_ffmpeg():
-    """Path of ffmpeg on PATH, or None. A program found in the current folder is never used."""
-    path = shutil.which("ffmpeg")
-    if path and _in_cwd(path):
+    """Path of a trusted ffmpeg on PATH, or None (see ffmpeg_problem for why one is refused)."""
+    path = which_ffmpeg()
+    if path and ffmpeg_problem(path):
         return None
     return path
 
 
 def find_ffmpeg():
-    path = shutil.which("ffmpeg")
-    if path and _in_cwd(path):
-        raise ToolError("the ffmpeg found (%s) is in the current folder, which is not trusted. "
-                        "Run from another folder, or install a real ffmpeg on PATH. %s."
-                        % (path, INSTALL_HINT["ffmpeg"]))
+    path = which_ffmpeg()
     if not path:
         raise ToolError("ffmpeg was not found on PATH. %s. "
                         "Run keyframe-doctor to check every dependency." % INSTALL_HINT["ffmpeg"])
+    problem = ffmpeg_problem(path)
+    if problem:
+        raise ToolError(problem)
     return path
 
 
@@ -311,9 +344,19 @@ def _quiet_stdout():
         pass
 
 
+def harden_stdout():
+    """A file name that the console code page cannot encode must not crash a print (stdout as a pipe is often cp1252)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except Exception:
+            pass
+
+
 def run_main(main):
     """Run main(); turn every failure into one line on stderr and exit code 1 (no traceback)."""
     require_python()
+    harden_stdout()
     try:
         code = main()
         if not safe_flush_stdout():

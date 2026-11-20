@@ -272,11 +272,14 @@ class TestV012(Tmp):
             os.chmod(path, 0o755)
         video = self.p("v.mp4")
         write_bytes(video, b"x" * 100)
-        env = {"PATH": shim + os.pathsep + os.environ.get("PATH", "")}
+        # 0.1.3: a .cmd ffmpeg on PATH is refused on Windows, so the shim is handed to coverage_stream directly
+        bb = load("blank_beats.py")
+        shim_path = os.path.join(shim, "ffmpeg.cmd" if WIN else "ffmpeg")
         start = time.time()
-        rc, _, se = run("blank_beats.py", ["--timeout", "2", "--", video], env=env, cwd=self.dir)
+        with self.assertRaises(Exception) as cm:
+            list(bb.coverage_stream(np, shim_path, video, 0.05, 16, 16, (255, 248, 239), 40.0, 2.0))
         took = time.time() - start
-        self.assertEqual(rc, 1, se)
+        se = str(cm.exception)
         self.assertIn("--timeout", se)
         self.assertLess(took, 6.5, "took %.1f s" % took)
 

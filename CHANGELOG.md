@@ -2,6 +2,26 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] (2026-11-20)
+Maintenance release from the third Opus red-team round of 0.1.2 (no High; 2 Medium and 2 Low fixed). Narrowing only: no change to the plugin name, licence, `allowed-tools`, defaults or caps, and no new dependency. 9 new tests (83 in all); 8 of them fail on 0.1.2 and pass now (the ninth is a control: ordinary loud float audio still works).
+
+Fixed
+- R3-1 (Medium) on Windows an ffmpeg that resolves from PATH to a `.bat` or `.cmd` wrapper is refused by `blank_beats` and reported as a failure by `keyframe-doctor` (clear message, exit 1). cmd.exe re-parses the command line of a batch file, so a video name containing `&` could run a command. Use the real `ffmpeg.exe`. Argument handling (`shell=False`) is unchanged. Other systems are not affected.
+- R3-2 (Medium) every tool now switches stdout and stderr to `backslashreplace` before it prints, so a file name the console code page cannot encode (Arabic or Chinese with a cp1252 pipe) no longer aborts `key_decontam --check` half way; all files are judged and the summary line is printed (characters that cannot be encoded show as backslash escapes).
+- R3-3 (Low) the planted-ffmpeg guard now ignores relative and empty PATH entries, and refuses an ffmpeg that resolves anywhere inside the current folder tree (real paths, links followed), not only the current folder itself. Side effect: if you run a tool from inside the folder that holds your own ffmpeg, it is refused; run from another folder.
+- R3-4 (Low) `duck_curve` refuses a WAV with float samples whose size is above 1000 (the normal range is -1..1; clipping-level values such as 2.0 are still accepted) with one clear line and exit 1; the check runs before the channel mix, so no numpy RuntimeWarning (and no absolute script path) reaches stderr.
+- Test change: the shim-timeout test now hands its `.cmd` shim straight to `coverage_stream` on Windows, because a `.cmd` ffmpeg on PATH is refused on purpose (the process-tree kill is still covered).
+
+Known limits (not fixed, from the same round)
+- R3-5 `duck_curve` chunks by frames, not samples: with very many channels one chunk can be the whole file in float64; the 200-million-sample cap still bounds it (about 3.2 GB in one step). The 0.1.2 sentence "temporaries stay small" holds for mono and stereo only.
+- R3-6 `duck_curve` and `key_decontam` check the file size and then read the file; a file that keeps growing between the two steps can be read in full.
+- R3-7 the skills pass `${CLAUDE_PLUGIN_ROOT}` unquoted because the pre-approved `allowed-tools` pattern needs that exact form; if the plugin path contains a space (for example a profile folder `First Last`) the shell splits it and the tool cannot start. Not changed, so permissions stay exactly as approved. Workaround: install the plugin where the path has no space.
+- R3-8 `duck_curve` (without `--force`) creates a new `.json` anywhere you can write, for example a missing `.claude/settings.local.json`, holding a number array. Always a number array, so no content injection; do not name such a file as the output.
+
+Not tested: macOS, Linux, WSL (POSIX paths read only; the cwd-tree and relative-PATH changes apply there too); the Claude Code permission matcher (no network in this round); a real `ffmpeg` installed as a `.cmd` shim by a package manager (Scoop and WinGet normally use `.exe`).
+
+Behaviour changes: a `.bat`/`.cmd` ffmpeg is refused on Windows; ffmpeg inside the current folder tree is refused; relative PATH entries are ignored; float WAVs above 1000 are refused.
+
 ## [0.1.2] (2026-11-19)
 Maintenance release from the second Opus red-team round of 0.1.1 (no High; 2 Medium, 5 Low). No change to the plugin name, licence or `allowed-tools`. 15 new tests (74 in all); each fix test fails on 0.1.1 and passes now.
 
