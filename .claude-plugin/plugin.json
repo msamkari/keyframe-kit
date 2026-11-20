@@ -1,0 +1,18 @@
+{
+  "name": "keyframe-kit",
+  "version": "0.1.0",
+  "description": "Three small media tools for video makers: key out a green-screen background from flat cartoon art and gate the edges for green fringe, build a per-frame music-ducking curve from a speech WAV, and find near-empty seconds in a video. Explicit dependency check (numpy, OpenCV, ffmpeg).",
+  "license": "MIT",
+  "keywords": [
+    "video",
+    "green-screen",
+    "chroma-key",
+    "audio-ducking",
+    "ffmpeg",
+    "media"
+  ],
+  "author": {
+    "name": "Mohammad Samkari",
+    "url": "https://github.com/msamkari"
+  }
+}
