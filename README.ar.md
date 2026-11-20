@@ -30,6 +30,15 @@ python scripts/kk_doctor.py [--tool key_decontam|duck_curve|blank_beats]
 
 `duck-curve` تحتاج numpy فقط (تقرأ ملفات WAV بقارئ صغير خاص فيها: PCM بعمق 8/16/24/32 بت وfloat بعمق 32/64). و`--help` لكل أداة يشتغل ولو ما ثبّت شي.
 
+## التثبيت
+
+```
+/plugin marketplace add msamkari/samkari-plugins
+/plugin install keyframe-kit@samkari-plugins
+```
+
+أو حمّله محلياً: `claude --plugin-dir /path/to/keyframe-kit`. ثبّت الاعتماديات أعلاه أولاً.
+
 ## الاستعمال
 
 قل لـClaude: «شِل الخلفية الخضراء من هذا الشيت»، «سوّ لي منحنى خفض للموسيقى لهذا التعليق الصوتي بـ30 فريم»، «وين الفراغ في هذا الفيديو؟». أو شغّل السكربتات بنفسك:

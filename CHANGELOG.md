@@ -2,7 +2,7 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] (unreleased, local build 2026-11-19)
+## [0.1.0] (2026-11-19)
 First version: three media tools and a dependency check, generalised from private working scripts.
 
 - `key-decontam` (`scripts/key_decontam.py`): green-screen keying for flat outlined art plus the `--check` fringe gate. The keying maths is unchanged; on a synthetic sheet the output is byte-identical to the original script (1 trial).
