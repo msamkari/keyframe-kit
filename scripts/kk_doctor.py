@@ -33,11 +33,12 @@ def module_status(name):
 
 
 def ffmpeg_status():
-    path = C.safe_which_ffmpeg()
+    path = C.which_ffmpeg()
     if not path:
-        if C.shutil.which("ffmpeg"):
-            return False, "only found in the current folder, which is not trusted; run from another folder"
         return False, "not found on PATH"
+    problem = C.ffmpeg_problem(path)
+    if problem:
+        return False, problem
     ver = C.ffmpeg_version(path)
     if not ver:
         return False, "found at %s but `ffmpeg -version` did not run" % path
