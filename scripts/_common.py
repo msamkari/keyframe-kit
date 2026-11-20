@@ -11,9 +11,11 @@ import argparse
 import importlib
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
+import uuid
 
 # Windows: do not search the current folder for programs (a planted ffmpeg.exe / ffmpeg.bat).
 os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
@@ -127,10 +129,75 @@ def ffmpeg_version(path):
     return first[0].strip() if first else None
 
 
+_LOCAL_DEVICE_PREFIX = re.compile(r"^\\\\\?\\[A-Za-z]:\\")   # local extended-length path, drive form
+
+
+def _unc_like(path):
+    """True if a path is a network (UNC) or device path once '/' is read as '\' (Windows treats both alike)."""
+    norm = path.replace("/", "\\") if os.name == "nt" else path
+    if os.name != "nt":
+        return path.startswith("//")
+    return norm.startswith("\\\\") and not _LOCAL_DEVICE_PREFIX.match(norm)
+
+
 def reject_network_path(path, what):
-    if path.startswith("\\\\") or path.startswith("//"):
+    """Refuse network (UNC) paths: the name as given and after os.path.abspath (mixed '/\' slashes included).
+
+    The local extended-length form (double backslash, question mark, backslash, drive letter) is allowed.
+    """
+    if path.startswith("//") or _unc_like(path) or _unc_like(os.path.abspath(path)):
         raise ToolError("%s is a network (UNC) path, which is refused: copy the file to a local folder first (%s)"
                         % (what, path))
+
+
+def reject_stream_path(path, what):
+    """Windows: refuse an NTFS alternate data stream (any ':' after the drive letter), for example s.wav:x.json."""
+    if os.name != "nt":
+        return
+    rest = os.path.abspath(path)
+    if rest.startswith("\\?\\"):
+        rest = rest[4:]
+    rest = os.path.splitdrive(rest)[1]
+    if ":" in rest:
+        raise ToolError("%s contains ':' after the drive letter (an NTFS alternate data stream), which is refused: %s"
+                        % (what, path))
+
+
+def reject_unsafe_path(path, what):
+    reject_network_path(path, what)
+    reject_stream_path(path, what)
+
+
+def _is_reparse(path):
+    """True for a symbolic link, or on Windows a junction or symlink (mount point / symlink reparse tag)."""
+    if os.path.islink(path):
+        return True
+    if os.name == "nt":
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        tag = getattr(st, "st_reparse_tag", 0)
+        return tag in (0xA0000003, 0xA000000C)   # IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK
+    return False
+
+
+def reject_link_in_folders(folder, what):
+    """Refuse a folder, or any folder above it, that is a symbolic link or junction (writes would be redirected).
+
+    On POSIX the first path component is skipped (/tmp, /var and /etc are links on macOS).
+    """
+    cur = os.path.abspath(folder)
+    while True:
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        if os.name != "nt" and os.path.dirname(parent) == parent:
+            break
+        if _is_reparse(cur):
+            raise ToolError("%s is inside a folder that is a symbolic link or junction, which is refused "
+                            "(the write could land somewhere else): %s" % (what, cur))
+        cur = parent
 
 
 def existing_file(path, what="input"):
@@ -141,7 +208,7 @@ def existing_file(path, what="input"):
     """
     if not path or "\x00" in path:
         raise ToolError("%s path is empty or invalid" % what)
-    reject_network_path(path, what)
+    reject_unsafe_path(path, what)
     full = os.path.abspath(path)
     if not os.path.exists(full):
         raise ToolError("%s not found: %s" % (what, path))
@@ -168,10 +235,50 @@ def check_output_file(full, force, what="output"):
         raise ToolError("%s has more than one hard link, which is refused even with --force: %s" % (what, full))
 
 
-def open_output(full, force, mode):
-    """Open an output file. Without force it is created exclusively ('x'), so nothing is ever replaced."""
-    kwargs = {} if "b" in mode else {"encoding": "utf-8"}
-    return open(full, ("w" if force else "x") + mode, **kwargs)
+def write_output(full, force, mode, writer, recheck=None, what="output"):
+    """Write one output file atomically: temp file in the same folder, re-check, then publish.
+
+    writer(fh) fills the open temp file. Without force the file is published with os.link, which fails if the
+    name exists, so an existing file is never replaced. With force the target is checked again just before
+    os.replace (plain file, no link, no hard link, and recheck() for tool-specific rules). A failure at any
+    point removes the temp file and leaves an existing target untouched.
+    """
+    folder = os.path.dirname(full)
+    reject_link_in_folders(folder, what)
+    tmp = os.path.join(folder, ".kk-%s.tmp" % uuid.uuid4().hex)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o666)
+    try:
+        kwargs = {} if "b" in mode else {"encoding": "utf-8"}
+        with os.fdopen(fd, "wb" if "b" in mode else "w", **kwargs) as fh:
+            writer(fh)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        if force:
+            check_output_file(full, True, what)
+            if recheck is not None:
+                recheck()
+            reject_link_in_folders(folder, what)
+            os.replace(tmp, full)
+        else:
+            try:
+                os.link(tmp, full)
+            except FileExistsError:
+                raise ToolError("%s already exists: %s (do not use --force unless the user explicitly asks)"
+                                % (what, full))
+            except (OSError, NotImplementedError, AttributeError):
+                with open(tmp, "rb") as src, open(full, "xb") as dst:   # no hard links here: exclusive create
+                    shutil.copyfileobj(src, dst)
+            os.unlink(tmp)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def guarded_write_target(path, allowed_exts, force, what="output"):
@@ -179,7 +286,7 @@ def guarded_write_target(path, allowed_exts, force, what="output"):
     plain regular file (no link) with an allowed extension. Network (UNC) paths are refused."""
     if not path or "\x00" in path:
         raise ToolError("%s path is empty or invalid" % what)
-    reject_network_path(path, what)
+    reject_unsafe_path(path, what)
     full = os.path.abspath(path)
     ext = os.path.splitext(full)[1].lower()
     if ext not in allowed_exts:
@@ -190,6 +297,7 @@ def guarded_write_target(path, allowed_exts, force, what="output"):
     parent = os.path.dirname(full)
     if not os.path.isdir(parent):
         raise ToolError("folder for %s does not exist: %s" % (what, parent))
+    reject_link_in_folders(parent, what)
     return full
 
 

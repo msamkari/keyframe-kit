@@ -2,6 +2,24 @@
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] (2026-11-19)
+Maintenance release from the second Opus red-team round of 0.1.1 (no High; 2 Medium, 5 Low). No change to the plugin name, licence or `allowed-tools`. 15 new tests (74 in all); each fix test fails on 0.1.1 and passes now.
+
+Fixed
+- M-1 UNC check: `reject_network_path` also checks the name after `os.path.abspath` and reads `/` as `\`, so `/\host\share` and `\/host/share/a` are refused; the local form `\\?\C:\...` is no longer refused by mistake (L-6). Windows only.
+- M-2 `duck_curve`: at most 200 million samples (frames x channels) are accepted, checked before any conversion, and the audio is converted in chunks of 2 million frames (no second copy of the data; curve values are identical). The 0.1.1 note "before any large allocation" was inaccurate: the old caps (500 MB file, 6 hours) did not bound memory (a 100 MB WAV needed 2.4 GB). Partly: the curve step itself still needs several float64 copies of the audio, so about 2 to 5 GB at the cap.
+- L-5 NTFS alternate data streams (`:` after the drive letter) are refused for inputs, outputs and OUT_DIR (Windows).
+- L-4 `blank_beats` passes `-format_whitelist` with common video containers, so a concat / ffconcat file renamed `.mp4` fails with exit 1. mp4, mov, mkv, webm, avi, ts and gif were checked. Unusual containers are refused.
+- L-3 an output folder (or any folder above it) that is a symbolic link or junction is refused for `duck_curve` and `key_decontam` (Windows: junction and symlink reparse tags; POSIX: links below the first path component). Cloud-sync placeholders are allowed.
+- L-1/L-2 outputs are written atomically: a unique temp file in the same folder, then, with `--force`, the target is re-checked (plain file, no link, no hard link, still an empty file or a JSON array of numbers) and replaced with `os.replace`; without `--force` the temp file is published with `os.link`, which never replaces an existing file. A failure leaves the original untouched and removes the temp file. Partly: the re-check and the replace are still two steps (a very narrow race remains).
+- L-7 tests: the regular-file check in `existing_file` is now covered (mutation-verified); the UNC test covers mixed slashes.
+- `blank_beats` timeout (L7, Windows and POSIX): ffmpeg runs in its own process group or session and is stopped as a tree (`taskkill /T /F /PID` on the PID this tool started, or `killpg`); a wrapper script that starts a child no longer outlives `--timeout` (test: shim sleeping 8 s, timeout 2 s).
+
+Known limits
+- Linux and macOS were not run; `blank_beats --size` large; the two partial items above; the 200-million-sample cap limits long stereo files (trim or downmix).
+
+Behaviour changes: `duck_curve` refuses WAVs above 200 million samples; `blank_beats` refuses unusual video containers; outputs under a linked folder are refused.
+
 ## [0.1.1] (2026-11-19)
 Maintenance release from an Opus red-team round (no High finding; 4 Medium, 8 Low). No change to the plugin name, licence or `allowed-tools`. Each fix has a regression test (19 new, 59 in all).
 

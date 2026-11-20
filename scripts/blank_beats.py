@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -29,6 +30,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common as C  # noqa: E402
 
 DEFAULT_BG = "#FFF8EF"
+# demuxers accepted for the input: common video containers only, so a concat / ffconcat / HLS text file
+# renamed to .mp4 is refused by ffmpeg itself
+FORMAT_WHITELIST = ("mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpegts,flv,mpeg,ogg,asf,gif,apng,"
+                    "m4v,h264,hevc,mpegvideo,ivf,nut,mxf,dv")
 PLAYLIST_EXTS = (".m3u8", ".m3u", ".ffconcat", ".txt")   # text files ffmpeg would parse and follow
 
 
@@ -49,12 +54,35 @@ def parse_size(text):
     return int(m.group(1)), int(m.group(2))
 
 
+def kill_tree(proc):
+    """Stop the process this script started and everything it started (a wrapper script's children).
+
+    Only the PID of our own child is used, never a name.
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=20)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def coverage_stream(np, ffmpeg, video, step, w, h, bg, tolerance, timeout):
     """Yield the content coverage (0..1) of each sampled frame. Raises ToolError on ffmpeg failure."""
-    cmd = [ffmpeg, "-v", "error", "-nostdin", "-protocol_whitelist", "file", "-i", video, "-an", "-sn",
+    cmd = [ffmpeg, "-v", "error", "-nostdin", "-protocol_whitelist", "file", "-format_whitelist", FORMAT_WHITELIST, "-i", video, "-an", "-sn",
            "-vf", "fps=%r,scale=%d:%d" % (1.0 / step, w, h),
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    if os.name == "nt":
+        group = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    else:
+        group = {"start_new_session": True}
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, **group)
     errbuf = []
 
     def drain():
@@ -67,7 +95,7 @@ def coverage_stream(np, ffmpeg, video, step, w, h, bg, tolerance, timeout):
 
     def on_timeout():
         timed_out.append(True)
-        proc.kill()
+        kill_tree(proc)
 
     timer = threading.Timer(timeout, on_timeout)
     timer.start()
@@ -91,7 +119,7 @@ def coverage_stream(np, ffmpeg, video, step, w, h, bg, tolerance, timeout):
         except OSError:
             pass
         if proc.poll() is None:
-            proc.kill()
+            kill_tree(proc)
         proc.wait()
         t_err.join(timeout=5)
     msg = (errbuf[0].decode("utf-8", "replace").strip() if errbuf else "")
