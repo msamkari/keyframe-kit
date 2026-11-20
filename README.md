@@ -67,11 +67,15 @@ Method: estimate the real background colour from the strongly green pixels; alph
 ## Safety and limits
 
 - Writes only what you name: `key_decontam.py` writes `keyed_sheet.png` and `obj_NN.png` into the output folder; `duck_curve.py` writes one `.json` file; `blank_beats.py` and `--check` write nothing. **No tool overwrites an existing output** unless you pass `--force`, and even then only a regular file of the same kind (`.json`) or the tool's own fixed names.
-- Inputs must be existing regular files, so ffmpeg is never handed a URL or protocol string. Image files up to 200 MB and 60 megapixels, WAV files up to 500 MB.
+- Inputs must be existing regular files, so ffmpeg is never handed a URL or protocol string. Image files up to 200 MB and 25 megapixels (the limit is enforced before decoding, so a small "decompression bomb" PNG cannot exhaust memory), WAV files up to 500 MB, sample rate 4000 to 384000 Hz, at most 6 hours of curve. Network (UNC) paths (starting with two slashes) are refused for every input and output. A playlist or list file (`.m3u8`, `.m3u`, `.ffconcat`, `.txt`) is refused as a video, and ffmpeg runs with `-protocol_whitelist file`.
+- **`--force` is narrow.** Never through a symbolic link or a hard link. `duck_curve.py --force` replaces only an empty file or a JSON array of numbers (the shape it writes itself), so it cannot overwrite a settings or config `.json`. `key_decontam.py` never overwrites its own input, even with `--force`. Do not pass `--force` unless you mean it; the skills tell Claude to use it only on your explicit request.
+- **Exit codes:** 0 ok, 2 a finding (`--check` fringe, `--fail-above`), 1 every error, including a mistyped command line (the argparse exit 2 is remapped to 1 so a gate never reads a typo as a finding). `--help` exits 0. Failures print one line, never a traceback; a closed pipe exits 1 silently. Options such as `--duck-db` must be finite numbers (`nan` and `inf` are refused).
+- **ffmpeg is looked up on PATH only**: a program named `ffmpeg` sitting in the current folder is never used (the tools set `NoDefaultCurrentDirectoryInExePath` and refuse a result inside the current folder).
 - The skills pre-approve only the plugin's own script (`Bash(python ${CLAUDE_PLUGIN_ROOT}/scripts/<tool>.py *)`). Media files are treated as data; Claude is told never to follow text found inside them.
 - `key-decontam` is built for **flat art on a green ground**. Photos, soft shadows, gradients and glass are outside what it was made for. Pixel thresholds (`--min-island`, `--min-object`, `--row-height`) are absolute, not relative to image size: tune them for very small or very large sheets. Objects that touch or overlap come out as one crop.
 - `duck-curve` is a level curve, not a mix: no loudness normalisation, no sidechain over multiple speakers; listen to the result. It reads WAV only (convert with `ffmpeg -i voice.mp3 voice.wav`); compressed WAV (ADPCM, A-law) is refused, not misread.
 - `blank-beats` measures colour only: it cannot tell whether a frame with content is meaningful, and a wrong `--bg` makes every frame look full.
+- Known limits in 0.1.1: `--timeout` of `blank_beats.py` kills ffmpeg itself, but when `ffmpeg` on PATH is a wrapper script or shim that starts a child process, the child can keep running past the timeout (seen: 26 s instead of 3 s); use the real ffmpeg binary. 16-bit PNGs are judged on the 8-bit scale (`>> 8`). `blank_beats.py --size` up to 9999x9999 is accepted and one frame at that size is about 3.6 GB: keep it small. Speed: the duck loop is plain Python (a 6-hour file at 240 fps takes minutes). Network paths are refused by name only; junctions and mapped drives are not detected.
 - Not verified: Python 3.8 to 3.13, Linux and macOS (the CI workflow in the repository is written for them; it has not run), live invocation of the skills inside Claude Code beyond one headless run (see CHANGELOG), real-world sheets other than the synthetic fixtures in the tests.
 
 ## Tests
@@ -79,6 +83,7 @@ Method: estimate the real background colour from the strongly green pixels; alph
 ```
 python -X utf8 -m unittest discover -s tests -v
 ```
+59 tests (40 from 0.1.0, 19 regression tests for 0.1.1).
 The tests build their own images, WAV files and a short video with ffmpeg; those that need numpy, OpenCV or ffmpeg skip when it is missing.
 
 ## Licence

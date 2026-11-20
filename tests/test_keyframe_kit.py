@@ -40,13 +40,13 @@ def script(name):
     return os.path.join(SCRIPTS, name)
 
 
-def run(name, args, env=None, python_flags=("-X", "utf8"), timeout=180):
+def run(name, args, env=None, python_flags=("-X", "utf8"), timeout=180, cwd=None):
     full_env = dict(os.environ)
     if env:
         full_env.update(env)
     done = subprocess.run([sys.executable] + list(python_flags) + [script(name)] + list(args),
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                          env=full_env, timeout=timeout)
+                          env=full_env, timeout=timeout, cwd=cwd)
     return done.returncode, done.stdout.decode("utf-8", "replace"), done.stderr.decode("utf-8", "replace")
 
 
@@ -249,7 +249,7 @@ class TestDuckCurve(Tmp):
         rc, so, _ = run("duck_curve.py", ["--help"])
         self.assertEqual(rc, 0)
         self.assertIn("--fps", so)
-        self.assertEqual(run("duck_curve.py", [])[0], 2)  # argparse usage error
+        self.assertEqual(run("duck_curve.py", [])[0], 1)  # usage errors exit 1, never 2 (2 means "finding")
 
 
 @unittest.skipIf(np is None or cv2 is None, "numpy and opencv needed")
@@ -480,7 +480,7 @@ class TestDependenciesAreHidden(Tmp):
         self.assertIn("pip install", so)
         self.assertIn("missing:", so)
         rc, so, _ = run("kk_doctor.py", ["--tool", "bogus"], python_flags=("-S", "-X", "utf8"))
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 1)
 
     def test_doctor_ok_when_everything_is_there(self):
         if np is None or cv2 is None or FFMPEG is None:
@@ -503,6 +503,332 @@ class TestDependenciesAreHidden(Tmp):
         rc, so, _ = run("kk_doctor.py", ["--tool", "blank_beats"], env={"PATH": empty})
         self.assertEqual(rc, 1)
         self.assertIn("FAIL", so)
+
+
+
+def read_bytes_of(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def png_bomb(path, w, h):
+    """A valid, tiny PNG that declares w x h all-zero 8-bit gray pixels (built row by row, no big buffer)."""
+    import zlib
+
+    def chunk(tag, body):
+        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
+    comp = zlib.compressobj(9)
+    row = b"\x00" * (w + 1)
+    data = b"".join(comp.compress(row) for _ in range(h)) + comp.flush()
+    write_bytes(path, b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
+                + chunk(b"IDAT", data) + chunk(b"IEND", b""))
+
+
+class TestV011(Tmp):
+    """Regression tests for the 0.1.1 red-team fixes (M1-M4, L1-L8)."""
+
+    def wav(self, name="s.wav", sr=44100, n=4410, bits=16):
+        path = self.p(name)
+        write_bytes(path, wav_bytes([0] * n if bits == 16 else [128] * n, sr=sr, bits=bits))
+        return path
+
+    # -- M1 ------------------------------------------------------------------------------------
+    @unittest.skipIf(np is None or cv2 is None, "numpy and opencv needed")
+    def test_m1_pixel_cap_is_enforced_before_decode(self):
+        kd = load("key_decontam.py")
+        self.assertEqual(os.environ.get("OPENCV_IO_MAX_IMAGE_PIXELS"), str(kd.MAX_PIXELS))
+        self.assertLessEqual(kd.MAX_PIXELS, 25 * 1000 * 1000)
+        bomb = self.p("bomb.png")
+        png_bomb(bomb, 8000, 8000)   # 64 MP, a few hundred KB
+        with self.assertRaises(Exception) as cm:
+            kd.check_png_header(bomb)   # the header check needs no decode at all
+        self.assertIn("megapixels", str(cm.exception))
+        rc, so, se = run("key_decontam.py", ["--check", bomb])
+        self.assertIn("megapixels", so + se)
+        # the OpenCV env limit is a second line of defence for non-PNG formats
+        probe = "\n".join([
+            "import sys",
+            "sys.path.insert(0, %r)" % SCRIPTS,
+            "import key_decontam, cv2, numpy as np",
+            "raw = np.fromfile(%r, np.uint8)" % bomb,
+            "try:",
+            "    im = cv2.imdecode(raw, 1)",
+            "except Exception:",
+            "    im = None",
+            "print('NONE' if im is None else 'DECODED')"])
+        done = subprocess.run([sys.executable, "-c", probe], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, timeout=120)
+        self.assertIn("NONE", done.stdout.decode())
+
+    # -- M2 ------------------------------------------------------------------------------------
+    @unittest.skipIf(np is None, "numpy not installed")
+    def test_m2_sample_rate_and_frame_caps(self):
+        for sr in (1, 3999, 384001):
+            rc, _, se = run("duck_curve.py", [self.wav(sr=sr, bits=8), self.p("o%d.json" % sr)])
+            self.assertEqual(rc, 1, sr)
+            self.assertIn("sample rate", se)
+            self.assertFalse(os.path.exists(self.p("o%d.json" % sr)))
+        rc, _, se = run("duck_curve.py", ["--fps", "1", "--tail-sec", "30000", self.wav(), self.p("big.json")])
+        self.assertEqual(rc, 1)
+        self.assertIn("frames", se)
+        self.assertFalse(os.path.exists(self.p("big.json")))
+        dc = load("duck_curve.py")
+        with self.assertRaises(Exception) as cm:   # refused before any large allocation
+            dc.duck_curve(np, np.zeros(10), 4000, fps=240.0, tail_s=60000.0)
+        self.assertIn("frames", str(cm.exception))
+        self.assertEqual(run("duck_curve.py", [self.wav(sr=4000), self.p("ok.json")])[0], 0)
+        self.assertEqual(run("duck_curve.py", [self.wav(sr=384000, n=3840), self.p("ok2.json")])[0], 0)
+
+    # -- M3 ------------------------------------------------------------------------------------
+    def test_m3_ffmpeg_planted_in_cwd_is_not_run(self):
+        plant = self.p("plant")
+        os.mkdir(plant)
+        marker = self.p("marker.txt")
+        if os.name == "nt":
+            write_bytes(os.path.join(plant, "ffmpeg.bat"),
+                        ('@echo off\r\necho x> "%s"\r\necho ffmpeg version 6.6.6-planted\r\n' % marker).encode())
+        else:
+            exe = os.path.join(plant, "ffmpeg")
+            write_bytes(exe, ("#!/bin/sh\necho x > '%s'\necho ffmpeg version 6.6.6-planted\n" % marker).encode())
+            os.chmod(exe, 0o755)
+        empty = self.p("emptybin")
+        os.mkdir(empty)
+        full_env = dict(os.environ)
+        full_env["PATH"] = empty + os.pathsep + os.path.dirname(sys.executable)
+        full_env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
+        full_env.pop("NoDefaultCurrentDirectoryInExePath", None)
+        done = subprocess.run([sys.executable, "-X", "utf8", script("kk_doctor.py"), "--tool", "blank_beats"], cwd=plant,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=full_env,
+                              timeout=60)
+        self.assertNotIn("planted", done.stdout.decode("utf-8", "replace"))
+        self.assertFalse(os.path.exists(marker), "planted ffmpeg was executed")
+
+    def test_m3_which_result_in_cwd_is_rejected(self):
+        C = load("_common.py")
+        plant = self.p("plant2")
+        os.mkdir(plant)
+        fake = os.path.join(plant, "ffmpeg.exe")
+        write_bytes(fake, b"x")
+        old_cwd, old_which = os.getcwd(), C.shutil.which
+        try:
+            os.chdir(plant)
+            C.shutil.which = lambda name, *a, **k: fake
+            with self.assertRaises(C.ToolError) as cm:
+                C.find_ffmpeg()
+            self.assertIn("current folder", str(cm.exception))
+            self.assertIsNone(C.safe_which_ffmpeg())
+        finally:
+            C.shutil.which = old_which
+            os.chdir(old_cwd)
+        self.assertEqual(os.environ.get("NoDefaultCurrentDirectoryInExePath"), "1")
+
+    # -- L1 ------------------------------------------------------------------------------------
+    def test_l1_usage_errors_exit_1_and_help_exits_0(self):
+        for name, args in (("duck_curve.py", []), ("kk_doctor.py", ["--tool", "nope"]), ("blank_beats.py", ["--bogus"]),
+                           ("key_decontam.py", ["--check", "--threshold-pct", "abc", "x.png"])):
+            rc, so, se = run(name, args)
+            self.assertEqual(rc, 1, name)
+            self.assertNotIn("Traceback", se)
+        for name in ("duck_curve.py", "kk_doctor.py", "blank_beats.py", "key_decontam.py"):
+            self.assertEqual(run(name, ["--help"])[0], 0, name)
+
+    @unittest.skipIf(np is None, "numpy not installed")
+    def test_l1_double_dash_handles_names_starting_with_a_dash(self):
+        write_bytes(self.p("-s.wav"), wav_bytes([0] * 4410))
+        rc, _, se = run("duck_curve.py", ["--", "-s.wav", "-o.json"], cwd=self.dir)
+        self.assertEqual(rc, 0, se)
+        self.assertTrue(os.path.exists(self.p("-o.json")))
+
+    # -- L2 ------------------------------------------------------------------------------------
+    @unittest.skipIf(np is None, "numpy not installed")
+    def test_l2_nan_and_inf_options_are_refused(self):
+        wav = self.wav()
+        for extra in (["--duck-db", "nan"], ["--hold-ms", "nan"], ["--lookahead-ms", "inf"], ["--tail-sec", "nan"],
+                      ["--fps", "nan"], ["--attack", "nan"], ["--threshold-db", "nan"]):
+            rc, _, se = run("duck_curve.py", extra + [wav, self.p("o.json")])
+            self.assertEqual(rc, 1, extra)
+            self.assertIn("finite", se)
+            self.assertNotIn("Traceback", se)
+        self.assertFalse(os.path.exists(self.p("o.json")))
+        for extra in (["--fail-above", "nan"], ["--min-run", "nan"], ["--tolerance", "nan"], ["--coverage", "nan"],
+                      ["--step", "nan"], ["--timeout", "inf"]):
+            rc, _, se = run("blank_beats.py", extra + [wav])
+            self.assertEqual(rc, 1, extra)
+            self.assertIn("finite", se)
+        for extra in (["--threshold-pct", "nan"], ["--lo", "nan"], ["--lo", "inf"]):
+            rc, _, se = run("key_decontam.py", extra + ["--check", wav])
+            self.assertEqual(rc, 1, extra)
+            self.assertIn("finite", se)
+        rc, _, se = run("key_decontam.py", ["--lo", "-1", "--check", wav])
+        self.assertEqual(rc, 1)
+        self.assertIn("--lo", se)
+
+    @unittest.skipIf(np is None, "numpy not installed")
+    def test_l2_duck_json_is_written_with_allow_nan_false(self):
+        self.assertIn("allow_nan=False", read_text(script("duck_curve.py")))
+
+    # -- L3 / M4 / L6 --------------------------------------------------------------------------
+    def can_symlink(self):
+        src, dst = self.p("_t_src"), self.p("_t_lnk")
+        write_bytes(src, b"x")
+        try:
+            os.symlink(src, dst)
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+        os.remove(dst)
+        return True
+
+    @unittest.skipIf(np is None, "numpy not installed")
+    def test_l3_duck_never_writes_through_a_symlink(self):
+        if not self.can_symlink():
+            self.skipTest("symlinks not available")
+        wav = self.wav()
+        planted = self.p("planted.bat")
+        link = self.p("dang.json")
+        os.symlink(planted, link)             # dangling
+        self.assertEqual(run("duck_curve.py", [wav, link])[0], 1)
+        self.assertFalse(os.path.exists(planted))
+        self.assertEqual(run("duck_curve.py", ["--force", wav, link])[0], 1)
+        self.assertFalse(os.path.exists(planted))
+        target = self.p("notjson.cfg")
+        write_bytes(target, b"[1, 2]")
+        link2 = self.p("lnk.json")
+        os.symlink(target, link2)
+        self.assertEqual(run("duck_curve.py", ["--force", wav, link2])[0], 1)
+        self.assertEqual(read_text(target), "[1, 2]")
+
+    @unittest.skipIf(np is None or cv2 is None, "numpy and opencv needed")
+    def test_l3_key_never_writes_through_a_symlink(self):
+        if not self.can_symlink():
+            self.skipTest("symlinks not available")
+        im = np.full((300, 300, 3), (20, 240, 25), np.uint8)
+        cv2.circle(im, (150, 150), 80, (40, 40, 230), -1)
+        sheet = self.p("sheet.png")
+        cv2.imencode(".png", im)[1].tofile(sheet)
+        out = self.p("kd")
+        os.mkdir(out)
+        evil = self.p("evil_target.txt")
+        os.symlink(evil, os.path.join(out, "keyed_sheet.png"))
+        for extra in ([], ["--force"]):
+            self.assertEqual(run("key_decontam.py", extra + [sheet, out])[0], 1)
+        self.assertFalse(os.path.exists(evil))
+
+    @unittest.skipIf(np is None, "numpy not installed")
+    def test_l3_hardlink_is_refused_with_force(self):
+        wav = self.wav()
+        a, b = self.p("a.json"), self.p("b.json")
+        write_bytes(a, b"[1.0]")
+        try:
+            os.link(a, b)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("hard links not available")
+        self.assertEqual(run("duck_curve.py", ["--force", wav, b])[0], 1)
+        self.assertEqual(read_text(a), "[1.0]")
+
+    @unittest.skipIf(np is None, "numpy not installed")
+    def test_m4_force_replaces_only_a_number_array(self):
+        wav = self.wav()
+        for content in (b'{"keep": 1}', b'{"name": "x", "version": "1.0.0"}', b'["a"]', b'[true]', b'[1, 2', b'hello',
+                        b'[NaN]', b'[[1]]'):
+            victim = self.p("settings.json")
+            write_bytes(victim, content)
+            rc, _, se = run("duck_curve.py", ["--force", wav, victim])
+            self.assertEqual(rc, 1, content)
+            self.assertIn("--force", se)
+            self.assertEqual(read_bytes_of(victim), content)
+        for content in (b"", b"[]", b"[1, 0.5, 0.28]"):
+            ok = self.p("mine.json")
+            write_bytes(ok, content)
+            rc, _, se = run("duck_curve.py", ["--force", wav, ok])
+            self.assertEqual(rc, 0, se)
+            self.assertIsInstance(json.loads(read_text(ok)), list)
+
+    @unittest.skipIf(np is None or cv2 is None, "numpy and opencv needed")
+    def test_l6_output_dir_equal_to_source_folder_is_refused(self):
+        im = np.full((300, 300, 3), (20, 240, 25), np.uint8)
+        cv2.circle(im, (150, 150), 80, (40, 40, 230), -1)
+        sub = self.p("same")
+        os.mkdir(sub)
+        sheet = os.path.join(sub, "keyed_sheet.png")
+        cv2.imencode(".png", im)[1].tofile(sheet)
+        before = read_bytes_of(sheet)
+        for extra in ([], ["--force"]):
+            rc, _, se = run("key_decontam.py", extra + [sheet, sub])
+            self.assertEqual(rc, 1, extra)
+            self.assertIn("input", se)
+            self.assertEqual(read_bytes_of(sheet), before)
+
+    # -- L5 ------------------------------------------------------------------------------------
+    def test_l5_run_main_turns_every_failure_into_one_line(self):
+        import contextlib
+        import io
+        C = load("_common.py")
+        for exc, word in ((OSError("disk on fire"), "disk on fire"), (MemoryError(), "memory"), (ValueError("odd"), "odd")):
+            def boom(e=exc):
+                raise e
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                C.run_main(boom)
+            self.assertEqual(cm.exception.code, 1)
+            lines = err.getvalue().strip().splitlines()
+            self.assertEqual(len(lines), 1, err.getvalue())
+            self.assertIn(word, lines[0])
+
+    def test_l5_broken_pipe_exits_1_silently(self):
+        proc = subprocess.Popen([sys.executable, "-X", "utf8", script("kk_doctor.py")], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        proc.stdout.close()
+        err = proc.stderr.read().decode("utf-8", "replace")
+        proc.stderr.close()
+        self.assertEqual(proc.wait(timeout=60), 1)
+        self.assertNotIn("Traceback", err)
+
+    def test_l5_need_module_catches_a_broken_module(self):
+        C = load("_common.py")
+        plant = self.p("mods")
+        os.mkdir(plant)
+        write_bytes(os.path.join(plant, "kk_broken_mod.py"), b"raise RuntimeError('broken wheel')\n")
+        sys.path.insert(0, plant)
+        try:
+            with self.assertRaises(C.ToolError) as cm:
+                C.need_module("kk_broken_mod")
+        finally:
+            sys.path.remove(plant)
+        self.assertIn("kk_broken_mod", str(cm.exception))
+
+    # -- L8 ------------------------------------------------------------------------------------
+    @unittest.skipIf(np is None or cv2 is None, "numpy and opencv needed")
+    def test_l8_16_bit_png_is_judged_on_the_8_bit_scale(self):
+        im = np.zeros((300, 300, 4), np.uint8)
+        cv2.circle(im, (150, 150), 80, (120, 130, 120, 255), -1)   # d = 10 on the 8-bit scale: below the gate
+        p8, p16 = self.p("a8.png"), self.p("a16.png")
+        cv2.imencode(".png", im)[1].tofile(p8)
+        cv2.imencode(".png", im.astype(np.uint16) * 257)[1].tofile(p16)
+        r8 = run("key_decontam.py", ["--check", p8])
+        r16 = run("key_decontam.py", ["--check", p16])
+        self.assertEqual(r8[0], 0, r8)
+        self.assertEqual(r16[0], 0, r16)
+
+    # -- UNC and L4 ----------------------------------------------------------------------------
+    @unittest.skipIf(np is None, "numpy not installed")
+    def test_unc_paths_are_refused_before_any_access(self):
+        for bad in ("\\\\host\\share\\x.wav", "//host/share/x.wav"):
+            rc, _, se = run("duck_curve.py", [bad, self.p("o.json")])
+            self.assertEqual(rc, 1)
+            self.assertIn("network", se)
+            rc, _, se = run("duck_curve.py", [self.wav(), bad.replace(".wav", ".json")])
+            self.assertEqual(rc, 1)
+            self.assertIn("network", se)
+
+    @unittest.skipIf(np is None or FFMPEG is None, "numpy and ffmpeg needed")
+    def test_l4_playlist_extensions_are_refused(self):
+        for ext in (".m3u8", ".M3U", ".ffconcat", ".txt"):
+            path = self.p("list" + ext)
+            write_bytes(path, b"#EXTM3U\nfile:other.txt\n")
+            rc, _, se = run("blank_beats.py", [path])
+            self.assertEqual(rc, 1, ext)
+            self.assertIn("playlist", se)
+        self.assertIn("-protocol_whitelist", read_text(script("blank_beats.py")))
 
 
 class TestHelpersAndManifest(unittest.TestCase):
@@ -543,6 +869,8 @@ class TestHelpersAndManifest(unittest.TestCase):
             cmd = "python ${CLAUDE_PLUGIN_ROOT}/scripts/" + mm.group(1)
             self.assertIn("\n" + cmd, text, "command text must be the same unquoted form")
             self.assertNotIn("Edit", allowed)
+            if n in ("duck-curve", "key-decontam"):
+                self.assertIn("never pass --force unless the user explicitly asks", text, n)
             self.assertNotIn("Write", allowed)
             self.assertTrue(text.startswith("---\nname: " + n + "\n"), n)
 

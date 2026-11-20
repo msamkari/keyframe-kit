@@ -10,7 +10,7 @@ Usage
   duck_curve.py [options] SPEECH.wav OUT.json
 
 Reads PCM 8/16/24/32-bit and IEEE float 32/64-bit WAV (mono or multi-channel, mixed to mono).
-Needs: numpy only. Exit codes: 0 ok, 1 tool error (unreadable or unsupported file, bad option).
+Needs: numpy only. Exit codes: 0 ok, 1 tool error (unreadable or unsupported file, bad option or command line; --help exits 0).
 Typical use: multiply the music track by the curve value of the current video frame (Remotion,
 ffmpeg volume expressions, a custom renderer). Frame rate must match your video (25 and 60 are common).
 """
@@ -24,6 +24,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common as C  # noqa: E402
 
 MAX_WAV_BYTES = 500 * 1024 * 1024
+MIN_RATE, MAX_RATE = 4000, 384000
+MAX_SECONDS = 6 * 3600          # longest audio plus tail that is accepted
+MAX_EXISTING_BYTES = 256 * 1024 * 1024
 
 
 def read_wav(np, path):
@@ -62,6 +65,9 @@ def read_wav(np, path):
     tag, ch, sr, bits = fmt
     if ch < 1 or sr < 1:
         raise C.ToolError("WAV header is invalid (channels=%d, rate=%d)" % (ch, sr))
+    if not (MIN_RATE <= sr <= MAX_RATE):
+        raise C.ToolError("WAV sample rate %d Hz is outside %d..%d Hz: resample it first, "
+                          "for example: ffmpeg -i in.wav -ar 48000 out.wav" % (sr, MIN_RATE, MAX_RATE))
     width = bits // 8
     if tag == 1 and bits in (8, 16, 24, 32):
         pass
@@ -75,6 +81,8 @@ def read_wav(np, path):
     data = data[:usable]
     if usable == 0:
         raise C.ToolError("WAV contains no audio samples")
+    if usable // frame_bytes / float(sr) > MAX_SECONDS:
+        raise C.ToolError("WAV is longer than %d hours: cut it first" % (MAX_SECONDS // 3600))
     if tag == 3:
         x = np.frombuffer(data, dtype="<f4" if bits == 32 else "<f8").astype(np.float64)
     elif bits == 8:
@@ -98,6 +106,9 @@ def duck_curve(np, x, sr, fps=25.0, duck_db=-11.0, threshold_db=-42.0, hold_ms=2
                lookahead_ms=70.0, attack_s=0.08, release_s=0.35, tail_s=1.0):
     """Return (gains float array, speech bool array)."""
     n = int(np.ceil(len(x) * fps / sr)) + int(round(tail_s * fps))
+    if n > MAX_SECONDS * fps:
+        raise C.ToolError("the curve would have %d frames (limit %d = %d hours at %g fps): "
+                          "use a shorter file, a smaller --tail-sec or a lower --fps" % (n, MAX_SECONDS * fps, MAX_SECONDS // 3600, fps))
     bounds = np.minimum(np.round(np.arange(n + 1) * (sr / fps)).astype(np.int64), len(x))
     cs = np.concatenate([[0.0], np.cumsum(x * x)])
     cnt = (bounds[1:] - bounds[:-1]).astype(np.float64)
@@ -131,19 +142,19 @@ def duck_curve(np, x, sr, fps=25.0, duck_db=-11.0, threshold_db=-42.0, hold_ms=2
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="duck_curve.py", description=__doc__.split("\n\n")[0],
+    p = C.KKParser(prog="duck_curve.py", description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("speech", metavar="SPEECH.wav")
     p.add_argument("out", metavar="OUT.json")
-    p.add_argument("--fps", type=float, default=25.0, help="video frame rate; one gain per frame (default 25)")
-    p.add_argument("--duck-db", type=float, default=-11.0, help="gain under speech in dB, 0 or negative (default -11)")
-    p.add_argument("--threshold-db", type=float, default=-42.0, help="frames louder than this dBFS count as speech (default -42)")
-    p.add_argument("--hold-ms", type=float, default=250.0, help="pauses shorter than this stay ducked (default 250)")
-    p.add_argument("--lookahead-ms", type=float, default=70.0, help="start ducking this early (default 70)")
-    p.add_argument("--attack", type=float, default=0.08, help="seconds to duck down (default 0.08)")
-    p.add_argument("--release", type=float, default=0.35, help="seconds to come back up (default 0.35)")
-    p.add_argument("--tail-sec", type=float, default=1.0, help="extra seconds of frames after the audio ends (default 1)")
-    p.add_argument("--force", action="store_true", help="overwrite an existing OUT.json (ask the user first)")
+    p.add_argument("--fps", type=C.finite_float, default=25.0, help="video frame rate; one gain per frame (default 25)")
+    p.add_argument("--duck-db", type=C.finite_float, default=-11.0, help="gain under speech in dB, 0 or negative (default -11)")
+    p.add_argument("--threshold-db", type=C.finite_float, default=-42.0, help="frames louder than this dBFS count as speech (default -42)")
+    p.add_argument("--hold-ms", type=C.finite_float, default=250.0, help="pauses shorter than this stay ducked (default 250)")
+    p.add_argument("--lookahead-ms", type=C.finite_float, default=70.0, help="start ducking this early (default 70)")
+    p.add_argument("--attack", type=C.finite_float, default=0.08, help="seconds to duck down (default 0.08)")
+    p.add_argument("--release", type=C.finite_float, default=0.35, help="seconds to come back up (default 0.35)")
+    p.add_argument("--tail-sec", type=C.finite_float, default=1.0, help="extra seconds of frames after the audio ends (default 1)")
+    p.add_argument("--force", action="store_true", help="replace an existing OUT.json, only if it is a JSON array of numbers or empty (never without the user's explicit request)")
     return p
 
 
@@ -162,16 +173,39 @@ def validate(a):
             raise C.ToolError("--%s must be between 0.001 and 30 seconds" % name)
 
 
+def check_replaceable(path):
+    """--force may only replace a file this tool could have written: empty, or a JSON array of numbers."""
+    if not os.path.exists(path):
+        return
+    size = os.path.getsize(path)
+    if size == 0:
+        return
+    why = "--force only replaces an empty file or a JSON array of numbers (the shape this tool writes); %s is not: %s" % (
+        "it" if size <= MAX_EXISTING_BYTES else "this file", path)
+    if size > MAX_EXISTING_BYTES:
+        raise C.ToolError(why)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.loads(fh.read(), parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    except (ValueError, UnicodeDecodeError, OSError):
+        raise C.ToolError(why)
+    ok = isinstance(data, list) and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in data)
+    if not ok:
+        raise C.ToolError(why)
+
+
 def main():
     a = build_parser().parse_args()
     validate(a)
     out = C.guarded_write_target(a.out, (".json",), a.force, "OUT.json")
+    if a.force:
+        check_replaceable(out)
     np = C.need_module("numpy")
     sr, x = read_wav(np, a.speech)
     g, s = duck_curve(np, x, sr, fps=a.fps, duck_db=a.duck_db, threshold_db=a.threshold_db, hold_ms=a.hold_ms,
                       lookahead_ms=a.lookahead_ms, attack_s=a.attack, release_s=a.release, tail_s=a.tail_sec)
-    with open(out, "w", encoding="utf-8") as fh:
-        json.dump([round(float(v), 4) for v in g], fh)
+    with C.open_output(out, a.force, "") as fh:
+        json.dump([round(float(v), 4) for v in g], fh, allow_nan=False)
     print("%d frames at %g fps, speech fraction %.3f" % (len(g), a.fps, float(s.mean())))
     if not s.any():
         print("note: no speech found above %g dBFS; the curve is flat 1.0. Check the file or lower --threshold-db."
