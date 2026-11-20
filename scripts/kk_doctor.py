@@ -33,8 +33,10 @@ def module_status(name):
 
 
 def ffmpeg_status():
-    path = C.shutil.which("ffmpeg")
+    path = C.safe_which_ffmpeg()
     if not path:
+        if C.shutil.which("ffmpeg"):
+            return False, "only found in the current folder, which is not trusted; run from another folder"
         return False, "not found on PATH"
     ver = C.ffmpeg_version(path)
     if not ver:
@@ -43,7 +45,7 @@ def ffmpeg_status():
 
 
 def main():
-    p = argparse.ArgumentParser(prog="kk_doctor.py", description=__doc__.split("\n\n")[0])
+    p = C.KKParser(prog="kk_doctor.py", description=__doc__.split("\n\n")[0])
     p.add_argument("--tool", choices=sorted(NEEDS), action="append", help="check only this tool (repeatable)")
     a = p.parse_args()
     tools = a.tool or sorted(NEEDS)

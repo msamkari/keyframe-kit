@@ -18,20 +18,37 @@ Needs: numpy and opencv-python (or opencv-python-headless). See keyframe-doctor.
 """
 import argparse
 import os
+import struct
 import sys
+
+# OpenCV reads this once when it is imported: it makes the decoder itself refuse huge images,
+# so a small "decompression bomb" file cannot allocate gigabytes before our own check runs.
+MAX_PIXELS = 25 * 1000 * 1000
+os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = str(MAX_PIXELS)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common as C  # noqa: E402
 
 MAX_FILE_BYTES = 200 * 1024 * 1024
-MAX_PIXELS = 60 * 1000 * 1000
 MAX_OBJECTS = 500
+
+
+def check_png_header(full):
+    """Refuse a PNG whose header declares more than MAX_PIXELS, before anything is decoded."""
+    with open(full, "rb") as fh:
+        head = fh.read(24)
+    if head[1:4] == b"PNG" and head[12:16] == b"IHDR":
+        w, h = struct.unpack(">II", head[16:24])
+        if w * h > MAX_PIXELS:
+            raise C.ToolError("image has more than %d megapixels (%dx%d): %s"
+                              % (MAX_PIXELS // 1000000, w, h, full))
 
 
 def load_image(cv2, np, path, flags):
     full = C.existing_file(path, "image")
     if os.path.getsize(full) > MAX_FILE_BYTES:
         raise C.ToolError("image is larger than %d MB: %s" % (MAX_FILE_BYTES // 1048576, path))
+    check_png_header(full)
     try:
         raw = np.fromfile(full, np.uint8)
         img = cv2.imdecode(raw, flags)
@@ -101,6 +118,8 @@ def objects(cv2, np, rgba, min_area=6000, row_height=200):
 def edge_green(cv2, np, path):
     """(ring pixels, green-tinted ring pixels), or a string naming why the file cannot be judged."""
     x = load_image(cv2, np, path, cv2.IMREAD_UNCHANGED)
+    if x.dtype == np.uint16:   # 16-bit PNG: judge on the same 0..255 scale as 8-bit files
+        x = (x >> 8).astype(np.uint8)
     if x.ndim < 3 or x.shape[2] != 4:
         return "no alpha channel"
     a = x[..., 3]
@@ -136,6 +155,11 @@ def do_check(cv2, np, args):
     return C.EXIT_FINDING if bad else C.EXIT_OK
 
 
+def write_png(path, buf, force):
+    with C.open_output(path, force, "b") as fh:
+        fh.write(buf.tobytes())
+
+
 def do_key(cv2, np, args):
     if len(args.paths) != 2:
         raise C.ToolError("keying needs exactly two arguments: SHEET_IMAGE OUT_DIR (or use --check FILE ...)")
@@ -145,6 +169,7 @@ def do_key(cv2, np, args):
     objs = objects(cv2, np, rgba, min_area=args.min_object, row_height=args.row_height)
     if len(objs) > MAX_OBJECTS:
         raise C.ToolError("%d objects found (limit %d): raise --min-object" % (len(objs), MAX_OBJECTS))
+    C.reject_network_path(outd, "OUT_DIR")
     outd = os.path.abspath(outd)
     if os.path.exists(outd) and not os.path.isdir(outd):
         raise C.ToolError("OUT_DIR exists and is not a folder: %s" % args.paths[1])
@@ -153,24 +178,24 @@ def do_key(cv2, np, args):
             raise C.ToolError("parent folder of OUT_DIR does not exist: %s" % os.path.dirname(outd))
     names = ["keyed_sheet.png"] + ["obj_%02d.png" % i for i in range(len(objs))]
     targets = [os.path.join(outd, n) for n in names]
+    src_real = os.path.normcase(os.path.realpath(src))
     for t in targets:  # validate every target before writing any
-        if os.path.exists(t):
-            if not args.force:
-                raise C.ToolError("output already exists: %s (ask the user before using --force)" % t)
-            if not os.path.isfile(t):
-                raise C.ToolError("output exists and is not a regular file: %s" % t)
+        if os.path.normcase(os.path.realpath(t)) == src_real or (
+                os.path.exists(t) and os.path.samefile(t, src)):
+            raise C.ToolError("output %s is the input image itself: choose another OUT_DIR (never overwritten, even with --force)" % t)
+        C.check_output_file(t, args.force, "output")
     os.makedirs(outd, exist_ok=True)
     print("bg colour BGR %s (%s)" % ([int(v) for v in bg], "estimated from the image" if estimated
                                      else "ASSUMED pure green: no strong green background found"))
     ok, buf = cv2.imencode(".png", rgba)
     if not ok:
         raise C.ToolError("could not encode keyed_sheet.png")
-    buf.tofile(targets[0])
+    write_png(targets[0], buf, args.force)
     for t, (x, y, w, h) in zip(targets[1:], objs):
         ok, buf = cv2.imencode(".png", rgba[y:y + h, x:x + w])
         if not ok:
             raise C.ToolError("could not encode %s" % t)
-        buf.tofile(t)
+        write_png(t, buf, args.force)
     print("objects %d" % len(objs))
     if not objs:
         print("note: no object reached --min-object %d px (bounding box); only keyed_sheet.png was written"
@@ -179,16 +204,16 @@ def do_key(cv2, np, args):
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="key_decontam.py", description=__doc__.split("\n\n")[0],
+    p = C.KKParser(prog="key_decontam.py", description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("paths", nargs="*", help="SHEET_IMAGE OUT_DIR, or with --check: PNG files")
     p.add_argument("--check", action="store_true", help="gate mode: count green-tinted edge pixels in keyed PNGs")
-    p.add_argument("--force", action="store_true", help="overwrite existing output files (ask the user first)")
-    p.add_argument("--lo", type=float, default=28.0, help="green-dominance below which a pixel is fully kept (default 28)")
+    p.add_argument("--force", action="store_true", help="overwrite existing output files, never links (only on the user's explicit request)")
+    p.add_argument("--lo", type=C.finite_float, default=28.0, help="green-dominance below which a pixel is fully kept (default 28)")
     p.add_argument("--min-island", type=int, default=1500, help="drop opaque islands smaller than this many pixels (default 1500)")
     p.add_argument("--min-object", type=int, default=6000, help="smallest object bounding box area to crop (default 6000)")
     p.add_argument("--row-height", type=int, default=200, help="rows of objects are grouped by this many pixels for ordering (default 200)")
-    p.add_argument("--threshold-pct", type=float, default=0.5, help="--check fails above this percent of green edge pixels (default 0.5)")
+    p.add_argument("--threshold-pct", type=C.finite_float, default=0.5, help="--check fails above this percent of green edge pixels (default 0.5)")
     p.add_argument("--min-ring", type=int, default=200, help="--check skips files with fewer edge pixels (default 200)")
     return p
 
@@ -200,6 +225,8 @@ def main():
     for name in ("min_island", "min_object", "row_height", "min_ring"):
         if getattr(args, name) < 1:
             raise C.ToolError("--%s must be at least 1" % name.replace("_", "-"))
+    if not (0 <= args.lo <= 255):
+        raise C.ToolError("--lo must be between 0 and 255")
     if not (0 <= args.threshold_pct <= 100):
         raise C.ToolError("--threshold-pct must be between 0 and 100")
     np = C.need_module("numpy")

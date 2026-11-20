@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common as C  # noqa: E402
 
 DEFAULT_BG = "#FFF8EF"
+PLAYLIST_EXTS = (".m3u8", ".m3u", ".ffconcat", ".txt")   # text files ffmpeg would parse and follow
 
 
 def parse_color(text):
@@ -50,7 +51,7 @@ def parse_size(text):
 
 def coverage_stream(np, ffmpeg, video, step, w, h, bg, tolerance, timeout):
     """Yield the content coverage (0..1) of each sampled frame. Raises ToolError on ffmpeg failure."""
-    cmd = [ffmpeg, "-v", "error", "-nostdin", "-i", video, "-an", "-sn",
+    cmd = [ffmpeg, "-v", "error", "-nostdin", "-protocol_whitelist", "file", "-i", video, "-an", "-sn",
            "-vf", "fps=%r,scale=%d:%d" % (1.0 / step, w, h),
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
@@ -117,17 +118,17 @@ def find_runs(empty, step):
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="blank_beats.py", description=__doc__.split("\n\n")[0],
+    p = C.KKParser(prog="blank_beats.py", description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("video", metavar="VIDEO")
     p.add_argument("--bg", default=DEFAULT_BG, help="background colour, hex (default %s)" % DEFAULT_BG)
-    p.add_argument("--tolerance", type=float, default=40.0, help="colour distance counted as content (default 40)")
-    p.add_argument("--coverage", type=float, default=0.004, help="content share below which a frame is empty (default 0.004)")
-    p.add_argument("--step", type=float, default=0.05, help="seconds between sampled frames (default 0.05)")
+    p.add_argument("--tolerance", type=C.finite_float, default=40.0, help="colour distance counted as content (default 40)")
+    p.add_argument("--coverage", type=C.finite_float, default=0.004, help="content share below which a frame is empty (default 0.004)")
+    p.add_argument("--step", type=C.finite_float, default=0.05, help="seconds between sampled frames (default 0.05)")
     p.add_argument("--size", default="108x192", help="analysis size WxH, any aspect (default 108x192)")
-    p.add_argument("--min-run", type=float, default=0.0, help="only report runs at least this many seconds (default 0 = all)")
-    p.add_argument("--fail-above", type=float, default=None, help="exit 2 when near-empty seconds exceed this")
-    p.add_argument("--timeout", type=float, default=600.0, help="kill ffmpeg after this many seconds (default 600)")
+    p.add_argument("--min-run", type=C.finite_float, default=0.0, help="only report runs at least this many seconds (default 0 = all)")
+    p.add_argument("--fail-above", type=C.finite_float, default=None, help="exit 2 when near-empty seconds exceed this")
+    p.add_argument("--timeout", type=C.finite_float, default=600.0, help="kill ffmpeg after this many seconds (default 600)")
     p.add_argument("--format", choices=("text", "json"), default="text")
     return p
 
@@ -147,6 +148,8 @@ def main():
     np = C.need_module("numpy")
     ffmpeg = C.find_ffmpeg()
     video = C.existing_file(a.video, "video")
+    if os.path.splitext(video)[1].lower() in PLAYLIST_EXTS:
+        raise C.ToolError("a playlist or list file is not a video (ffmpeg would follow what it lists): %s" % a.video)
     covs = list(coverage_stream(np, ffmpeg, video, a.step, w, h, bg, a.tolerance, a.timeout))
     empty = [c < a.coverage for c in covs]
     runs = [r for r in find_runs(empty, a.step) if r[1] - r[0] >= a.min_run - 1e-9]
