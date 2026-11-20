@@ -27,6 +27,24 @@ MAX_WAV_BYTES = 500 * 1024 * 1024
 MIN_RATE, MAX_RATE = 4000, 384000
 MAX_SECONDS = 6 * 3600          # longest audio plus tail that is accepted
 MAX_EXISTING_BYTES = 256 * 1024 * 1024
+MAX_SAMPLES = 200 * 1000 * 1000   # total samples (frames x channels) accepted; checked before any conversion
+CHUNK_FRAMES = 2 * 1000 * 1000     # frames converted to float64 per step, so temporaries stay small
+
+
+def _decode(np, data, tag, bits):
+    """Samples of one chunk as float64 scaled to about -1..1 (interleaved channels, not yet mixed down)."""
+    if tag == 3:
+        return np.frombuffer(data, dtype="<f4" if bits == 32 else "<f8").astype(np.float64)
+    if bits == 8:
+        return (np.frombuffer(data, dtype=np.uint8).astype(np.float64) - 128.0) / 128.0
+    if bits == 16:
+        return np.frombuffer(data, dtype="<i2").astype(np.float64) / 32768.0
+    if bits == 24:
+        b = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+        v = np.where(v & 0x800000, v - 0x1000000, v)
+        return v.astype(np.float64) / 8388608.0
+    return np.frombuffer(data, dtype="<i4").astype(np.float64) / 2147483648.0
 
 
 def read_wav(np, path):
@@ -40,6 +58,7 @@ def read_wav(np, path):
     if len(blob) < 12 or blob[:4] not in (b"RIFF", b"RF64") or blob[8:12] != b"WAVE":
         raise C.ToolError("not a WAV file (no RIFF/WAVE header): %s. Convert it first, "
                           "for example: ffmpeg -i in.mp3 out.wav" % path)
+    view = memoryview(blob)
     pos, fmt, data = 12, None, None
     while pos + 8 <= len(blob):
         cid = blob[pos:pos + 4]
@@ -54,7 +73,7 @@ def read_wav(np, path):
             fmt = (tag, ch, sr, bits)
         elif cid == b"data" and data is None:
             end = min(body + clen, len(blob))  # streamed files may declare 0xFFFFFFFF
-            data = blob[body:end]
+            data = view[body:end]   # a view: no second copy of the audio
             if fmt is not None:
                 break
         pos = body + clen + (clen & 1)
@@ -83,22 +102,18 @@ def read_wav(np, path):
         raise C.ToolError("WAV contains no audio samples")
     if usable // frame_bytes / float(sr) > MAX_SECONDS:
         raise C.ToolError("WAV is longer than %d hours: cut it first" % (MAX_SECONDS // 3600))
-    if tag == 3:
-        x = np.frombuffer(data, dtype="<f4" if bits == 32 else "<f8").astype(np.float64)
-    elif bits == 8:
-        x = (np.frombuffer(data, dtype=np.uint8).astype(np.float64) - 128.0) / 128.0
-    elif bits == 16:
-        x = np.frombuffer(data, dtype="<i2").astype(np.float64) / 32768.0
-    elif bits == 24:
-        b = np.frombuffer(data, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
-        v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
-        v = np.where(v & 0x800000, v - 0x1000000, v)
-        x = v.astype(np.float64) / 8388608.0
-    else:
-        x = np.frombuffer(data, dtype="<i4").astype(np.float64) / 2147483648.0
-    x = x.reshape(-1, ch).mean(axis=1) if ch > 1 else x
-    if not np.all(np.isfinite(x)):
-        raise C.ToolError("WAV contains NaN or infinite samples")
+    if usable // width > MAX_SAMPLES:
+        raise C.ToolError("WAV has %d million samples (limit %d million): cut it or downmix it first"
+                          % (usable // width // 1000000, MAX_SAMPLES // 1000000))
+    nframes = usable // frame_bytes
+    x = np.empty(nframes, dtype=np.float64)
+    for start in range(0, nframes, CHUNK_FRAMES):
+        stop = min(nframes, start + CHUNK_FRAMES)
+        part = _decode(np, data[start * frame_bytes:stop * frame_bytes], tag, bits)
+        part = part.reshape(-1, ch).mean(axis=1) if ch > 1 else part
+        if not np.all(np.isfinite(part)):
+            raise C.ToolError("WAV contains NaN or infinite samples")
+        x[start:stop] = part
     return int(sr), x
 
 
@@ -204,8 +219,9 @@ def main():
     sr, x = read_wav(np, a.speech)
     g, s = duck_curve(np, x, sr, fps=a.fps, duck_db=a.duck_db, threshold_db=a.threshold_db, hold_ms=a.hold_ms,
                       lookahead_ms=a.lookahead_ms, attack_s=a.attack, release_s=a.release, tail_s=a.tail_sec)
-    with C.open_output(out, a.force, "") as fh:
-        json.dump([round(float(v), 4) for v in g], fh, allow_nan=False)
+    values = [round(float(v), 4) for v in g]
+    C.write_output(out, a.force, "", lambda fh: json.dump(values, fh, allow_nan=False),
+                   recheck=lambda: check_replaceable(out), what="OUT.json")
     print("%d frames at %g fps, speech fraction %.3f" % (len(g), a.fps, float(s.mean())))
     if not s.any():
         print("note: no speech found above %g dBFS; the curve is flat 1.0. Check the file or lower --threshold-db."

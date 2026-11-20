@@ -75,7 +75,7 @@ Method: estimate the real background colour from the strongly green pixels; alph
 - `key-decontam` is built for **flat art on a green ground**. Photos, soft shadows, gradients and glass are outside what it was made for. Pixel thresholds (`--min-island`, `--min-object`, `--row-height`) are absolute, not relative to image size: tune them for very small or very large sheets. Objects that touch or overlap come out as one crop.
 - `duck-curve` is a level curve, not a mix: no loudness normalisation, no sidechain over multiple speakers; listen to the result. It reads WAV only (convert with `ffmpeg -i voice.mp3 voice.wav`); compressed WAV (ADPCM, A-law) is refused, not misread.
 - `blank-beats` measures colour only: it cannot tell whether a frame with content is meaningful, and a wrong `--bg` makes every frame look full.
-- Known limits in 0.1.1: `--timeout` of `blank_beats.py` kills ffmpeg itself, but when `ffmpeg` on PATH is a wrapper script or shim that starts a child process, the child can keep running past the timeout (seen: 26 s instead of 3 s); use the real ffmpeg binary. 16-bit PNGs are judged on the 8-bit scale (`>> 8`). `blank_beats.py --size` up to 9999x9999 is accepted and one frame at that size is about 3.6 GB: keep it small. Speed: the duck loop is plain Python (a 6-hour file at 240 fps takes minutes). Network paths are refused by name only; junctions and mapped drives are not detected.
+- Known limits in 0.1.2: 16-bit PNGs are judged on the 8-bit scale (`>> 8`). `blank_beats.py --size` up to 9999x9999 is accepted and one frame at that size is about 3.6 GB: keep it small. `duck_curve.py` accepts at most 200 million samples (frames x channels; about 69 minutes of mono 48 kHz audio) and then needs roughly 2 to 5 GB of memory: trim or downmix longer files. Speed: the duck loop is plain Python (a 6-hour file at 240 fps takes minutes). Paths: network (UNC) paths are refused by name only (mixed slashes included; mapped drives are not detected); an NTFS alternate data stream (`:` after the drive letter) is refused on Windows; a symbolic link or junction as the output folder or any folder above it is refused (Windows junctions and symlinks by reparse tag, POSIX links below the first path component). Cloud-sync placeholders are not treated as links. The final check before replacing a file with `--force` and the replacement are two steps, so a hostile local process that swaps the target in that tiny gap can still win; there is no `fsync` of the folder. On Windows the ffmpeg process tree is stopped with `taskkill /T /F /PID` on the PID this tool started; a shim that detaches a grandchild into its own job can survive. `blank_beats.py` only opens common video containers (`-format_whitelist`); an unusual container is refused and needs converting first.
 - Not verified: Python 3.8 to 3.13, Linux and macOS (the CI workflow in the repository is written for them; it has not run), live invocation of the skills inside Claude Code beyond one headless run (see CHANGELOG), real-world sheets other than the synthetic fixtures in the tests.
 
 ## Tests
@@ -83,7 +83,7 @@ Method: estimate the real background colour from the strongly green pixels; alph
 ```
 python -X utf8 -m unittest discover -s tests -v
 ```
-59 tests (40 from 0.1.0, 19 regression tests for 0.1.1).
+74 tests (40 from 0.1.0, 19 regression tests for 0.1.1, 15 for 0.1.2).
 The tests build their own images, WAV files and a short video with ffmpeg; those that need numpy, OpenCV or ffmpeg skip when it is missing.
 
 ## Licence

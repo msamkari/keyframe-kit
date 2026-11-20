@@ -156,8 +156,7 @@ def do_check(cv2, np, args):
 
 
 def write_png(path, buf, force):
-    with C.open_output(path, force, "b") as fh:
-        fh.write(buf.tobytes())
+    C.write_output(path, force, "b", lambda fh: fh.write(buf.tobytes()))
 
 
 def do_key(cv2, np, args):
@@ -169,13 +168,14 @@ def do_key(cv2, np, args):
     objs = objects(cv2, np, rgba, min_area=args.min_object, row_height=args.row_height)
     if len(objs) > MAX_OBJECTS:
         raise C.ToolError("%d objects found (limit %d): raise --min-object" % (len(objs), MAX_OBJECTS))
-    C.reject_network_path(outd, "OUT_DIR")
+    C.reject_unsafe_path(outd, "OUT_DIR")
     outd = os.path.abspath(outd)
     if os.path.exists(outd) and not os.path.isdir(outd):
         raise C.ToolError("OUT_DIR exists and is not a folder: %s" % args.paths[1])
     if not os.path.isdir(outd):
         if not os.path.isdir(os.path.dirname(outd)):
             raise C.ToolError("parent folder of OUT_DIR does not exist: %s" % os.path.dirname(outd))
+    C.reject_link_in_folders(outd if os.path.isdir(outd) else os.path.dirname(outd), "OUT_DIR")
     names = ["keyed_sheet.png"] + ["obj_%02d.png" % i for i in range(len(objs))]
     targets = [os.path.join(outd, n) for n in names]
     src_real = os.path.normcase(os.path.realpath(src))
