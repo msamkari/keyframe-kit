@@ -136,7 +136,7 @@ def _unc_like(path):
     """True if a path is a network (UNC) or device path once '/' is read as '\' (Windows treats both alike)."""
     norm = path.replace("/", "\\") if os.name == "nt" else path
     if os.name != "nt":
-        return path.startswith("//")
+        return path.startswith("//") or path.startswith("\\\\")
     return norm.startswith("\\\\") and not _LOCAL_DEVICE_PREFIX.match(norm)
 
 
